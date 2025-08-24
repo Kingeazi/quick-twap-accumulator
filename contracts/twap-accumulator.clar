@@ -329,3 +329,136 @@
     (ok true)
   )
 )
+;; Check if an address is a permitted oracle
+(define-private (is-permitted-oracle (oracle principal))
+  (default-to false (map-get? oracles oracle))
+)
+
+;; Validate price input
+(define-private (is-valid-price (price uint))
+  (and (> price u0) (< price u1000000000000)) ;; Sanity check price range
+)
+
+;; Initialize a new trading pair for TWAP tracking
+(define-public (initialize-pair 
+  (pair-name (string-ascii 32)) 
+  (tracking-interval uint)
+)
+  (begin
+    ;; Prevent re-initialization of existing pairs
+    (asserts! (is-none (map-get? twap-pairs pair-name)) ERR-DUPLICATE-PAIR)
+    
+    ;; Validate tracking interval
+    (asserts! (> tracking-interval u0) ERR-INVALID-INTERVAL)
+    
+    ;; Set up initial pair configuration
+    (map-set twap-pairs
+      pair-name
+      {
+        last-price: u0,
+        last-updated-block: block-height,
+        total-price-accumulator: u0,
+        tracking-interval: tracking-interval
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+;; Update price for a trading pair
+(define-public (update-price 
+  (pair-name (string-ascii 32)) 
+  (current-price uint)
+)
+  (let (
+    (pair-data (unwrap! (map-get? twap-pairs pair-name) ERR-PAIR-NOT-FOUND))
+    (current-block block-height)
+  )
+    ;; Check accumulator is not paused
+    (asserts! (not (var-get is-accumulator-paused)) ERR-ACCUMULATOR-PAUSED)
+    
+    ;; Verify caller is a permitted oracle
+    (asserts! (is-permitted-oracle tx-sender) ERR-ORACLE-NOT-PERMITTED)
+    
+    ;; Validate price input
+    (asserts! (is-valid-price current-price) ERR-INVALID-PRICE)
+    
+    ;; Compute price accumulation
+    (let (
+      (block-diff (- current-block (get last-updated-block pair-data)))
+      (accumulated-price (+ 
+        (get total-price-accumulator pair-data) 
+        (* (get last-price pair-data) block-diff)
+      ))
+    )
+      ;; Update pair data
+      (map-set twap-pairs
+        pair-name
+        {
+          last-price: current-price,
+          last-updated-block: current-block,
+          total-price-accumulator: accumulated-price,
+          tracking-interval: (get tracking-interval pair-data)
+        }
+      )
+      
+      ;; Record price in history
+      (map-set price-history 
+        {pair: pair-name, block-height: current-block}
+        {price: current-price}
+      )
+      
+      (ok true)
+    )
+  )
+)
+
+;; Retrieve Time-Weighted Average Price for a pair
+(define-read-only (get-twap 
+  (pair-name (string-ascii 32))
+)
+  (let (
+    (pair-data (unwrap! (map-get? twap-pairs pair-name) ERR-PAIR-NOT-FOUND))
+    (current-block block-height)
+    (block-diff (- current-block (get last-updated-block pair-data)))
+  )
+    ;; Ensure sufficient update history exists
+    (asserts! (>= block-diff (get tracking-interval pair-data)) ERR-INSUFFICIENT-HISTORY)
+    
+    (ok 
+      (/ 
+        (+ 
+          (get total-price-accumulator pair-data)
+          (* (get last-price pair-data) block-diff)
+        )
+        block-diff
+      )
+    )
+  )
+)
+
+;; Administrative: Set oracle permission
+(define-public (set-oracle-permission 
+  (oracle principal)
+  (is-permitted bool)
+)
+  (begin
+    ;; Only contract admin can modify oracle permissions
+    (asserts! (is-eq tx-sender (var-get contract-admin)) ERR-NOT-AUTHORIZED)
+    
+    (map-set oracles oracle is-permitted)
+    (ok true)
+  )
+)
+
+;; Administrative: Pause/Unpause accumulator
+(define-public (toggle-accumulator-status)
+  (begin
+    ;; Only contract admin can pause/unpause
+    (asserts! (is-eq tx-sender (var-get contract-admin)) ERR-NOT-AUTHORIZED)
+    
+    (var-set is-accumulator-paused (not (var-get is-accumulator-paused)))
+    (ok true)
+  )
+)
